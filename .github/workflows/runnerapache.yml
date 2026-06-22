@@ -1,4 +1,4 @@
-name: Windows RDP via Guacamole
+name: Windows RDP via Guacamole Browser
 
 on:
   workflow_dispatch:
@@ -9,235 +9,207 @@ jobs:
     timeout-minutes: 360
     
     steps:
-      - name: Configure Windows for RDP
+      - name: Configure Windows Runner for RDP Access
         shell: pwsh
         run: |
+          Write-Host "Configuring Windows Runner for RDP access..."
+          
           # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           
-          # Set RDP security layer
+          # Configure RDP to not require Network Level Authentication
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
           
-          # Set password for existing runneradmin user
+          # Set password for runneradmin (the default GitHub Actions user)
           $rdpPassword = "RunnerPass123!"
           $password = ConvertTo-SecureString $rdpPassword -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $password -ErrorAction SilentlyContinue
+          Set-LocalUser -Name "runneradmin" -Password $password
           
-          # Add to Remote Desktop Users
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+          # Add runneradmin to Remote Desktop Users group
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin"
           
-          # Restart RDP service
+          # Make sure TermService is running
+          Set-Service -Name TermService -StartupType Automatic
           Restart-Service TermService -Force
           
-          Write-Host "RDP configured. Username: runneradmin, Password: $rdpPassword"
+          # Get the IP address for reference
+          $ipAddress = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "*Loopback*"} | Select-Object -First 1).IPAddress
+          
+          Write-Host "========================================================" -ForegroundColor Green
+          Write-Host "RDP Configuration Complete!" -ForegroundColor Green
+          Write-Host "Windows IP: $ipAddress" -ForegroundColor Cyan
+          Write-Host "RDP Username: runneradmin" -ForegroundColor Yellow
+          Write-Host "RDP Password: RunnerPass123!" -ForegroundColor Yellow
+          Write-Host "RDP Port: 3389" -ForegroundColor Yellow
+          Write-Host "========================================================" -ForegroundColor Green
 
-      - name: Install WSL
+      - name: Install WSL and Docker
         shell: pwsh
         run: |
           Write-Host "Installing WSL..."
-          wsl --install -d Ubuntu-22.04 --no-launch 2>$null
+          wsl --install -d Ubuntu-22.04 --no-launch
           Start-Sleep -Seconds 30
-          wsl --set-default-version 2
-          Write-Host "WSL installed"
-
-      - name: Setup Docker in WSL
-        shell: pwsh
-        run: |
-          Write-Host "Installing Docker..."
-          wsl bash -c "sudo apt-get update -qq"
+          
+          Write-Host "Installing Docker in WSL..."
+          wsl bash -c "sudo apt-get update && sudo apt-get install -y ca-certificates curl"
           wsl bash -c "curl -fsSL https://get.docker.com | sudo sh"
           wsl bash -c "sudo service docker start"
-          Write-Host "Docker installed and started"
+          
+          Write-Host "Docker ready"
 
-      - name: Create Guacamole Configuration
+      - name: Setup Apache Guacamole in Docker
         shell: pwsh
         run: |
-          Write-Host "Creating Guacamole configuration..."
+          Write-Host "Setting up Guacamole..."
           
-          # Create directory
-          wsl bash -c "sudo mkdir -p /etc/guacamole"
+          # Create guacamole config directory
+          wsl bash -c "sudo mkdir -p /opt/guacamole"
           
-          # Create user-mapping.xml
-          $xmlContent = @'
+          # Create user-mapping.xml for Guacamole authentication
+          # This tells Guacamole to connect to the Windows host's RDP
+          $userMapping = @'
 <user-mapping>
     <authorize username="guacadmin" password="guacadmin">
-        <connection name="Windows Runner RDP">
+        <connection name="GitHub Windows Runner">
             <protocol>rdp</protocol>
             <param name="hostname">host.docker.internal</param>
             <param name="port">3389</param>
-            <param name="security">any</param>
-            <param name="ignore-cert">true</param>
             <param name="username">runneradmin</param>
             <param name="password">RunnerPass123!</param>
+            <param name="ignore-cert">true</param>
+            <param name="security">any</param>
+            <param name="resize-method">display-update</param>
+            <param name="enable-wallpaper">false</param>
+            <param name="enable-theming">false</param>
+            <param name="enable-font-smoothing">true</param>
+            <param name="enable-full-window-drag">false</param>
+            <param name="enable-desktop-composition">false</param>
+            <param name="enable-menu-animations">false</param>
         </connection>
     </authorize>
 </user-mapping>
 '@
           
-          # Save XML to a temp file and copy to WSL
-          $xmlPath = "$env:TEMP\user-mapping.xml"
-          $xmlContent | Out-File -FilePath $xmlPath -Encoding ASCII -NoNewline
+          # Save to temp file
+          $tempPath = "$env:TEMP\user-mapping.xml"
+          $userMapping | Out-File -FilePath $tempPath -Encoding ASCII -NoNewline
           
           # Copy to WSL
-          $wslPath = $xmlPath -replace '\\', '/' -replace 'C:', '/mnt/c'
-          wsl bash -c "sudo cp '$wslPath' /etc/guacamole/user-mapping.xml"
-          wsl bash -c "sudo chmod 644 /etc/guacamole/user-mapping.xml"
+          wsl bash -c "sudo cp '$(wslpath -u $tempPath)' /opt/guacamole/user-mapping.xml"
           
-          Write-Host "Guacamole configuration created"
-
-      - name: Start Guacamole Daemon
-        shell: pwsh
-        run: |
-          Write-Host "Starting guacd..."
+          # Start Guacamole daemon (guacd)
+          Write-Host "Starting guacd container..."
           wsl bash -c "sudo docker run -d --name guacd --restart unless-stopped guacamole/guacd"
-          Start-Sleep -Seconds 3
           
-          # Verify guacd is running
-          $guacdStatus = wsl bash -c "sudo docker ps --filter name=guacd --format '{{.Status}}'"
-          Write-Host "guacd status: $guacdStatus"
-
-      - name: Start Guacamole Web Client
-        shell: pwsh
-        run: |
+          # Start Guacamole web client
           Write-Host "Starting Guacamole web client..."
-          wsl bash -c "sudo docker run -d --name guacamole --restart unless-stopped -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -v /etc/guacamole:/etc/guacamole --link guacd:guacd -p 8080:8080 guacamole/guacamole"
+          wsl bash -c "sudo docker run -d --name guacamole --restart unless-stopped --add-host=host.docker.internal:host-gateway -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -v /opt/guacamole:/etc/guacamole --link guacd:guacd -p 8080:8080 guacamole/guacamole"
+          
           Start-Sleep -Seconds 5
           
-          # Verify guacamole is running
-          $guacStatus = wsl bash -c "sudo docker ps --filter name=guacamole --format '{{.Status}}'"
-          Write-Host "Guacamole status: $guacStatus"
-          
-          # Test connectivity
-          Write-Host "Testing Guacamole web interface..."
-          wsl bash -c "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/guacamole/"
+          # Verify containers are running
+          Write-Host "Checking container status..."
+          wsl bash -c "sudo docker ps"
 
       - name: Setup Cloudflare Tunnel
         shell: pwsh
         run: |
-          Write-Host "Installing Cloudflare tunnel..."
-          wsl bash -c "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
-          wsl bash -c "sudo dpkg -i cloudflared-linux-amd64.deb"
+          Write-Host "Downloading and installing Cloudflare tunnel..."
           
-          Write-Host "Starting Cloudflare tunnel in background..."
-          # Start tunnel and redirect output to a file
-          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 2>&1 | tee /tmp/tunnel.log &"
+          # Install cloudflared in WSL
+          wsl bash -c "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -O /tmp/cloudflared.deb"
+          wsl bash -c "sudo dpkg -i /tmp/cloudflared.deb"
           
-          Write-Host "Waiting for tunnel URL to appear..."
+          Write-Host "Starting Cloudflare tunnel to expose Guacamole..."
           
-          # Wait and check for the URL multiple times
-          $tunnelUrl = $null
-          $maxAttempts = 12
-          $attempt = 0
+          # Start tunnel and capture output
+          wsl bash -c "cloudflared tunnel --url http://localhost:8080 2>&1 | tee /tmp/tunnel.log &"
           
-          while ($attempt -lt $maxAttempts -and -not $tunnelUrl) {
-            $attempt++
-            Write-Host "Attempt $attempt of $maxAttempts..."
-            Start-Sleep -Seconds 5
-            
-            # Try to extract the URL
-            $tunnelUrl = wsl bash -c "cat /tmp/tunnel.log 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -n 1"
-            
-            if ($tunnelUrl) {
-              Write-Host "Tunnel URL found: $tunnelUrl"
-              break
-            }
-          }
+          # Wait for tunnel URL
+          Write-Host "Waiting for tunnel URL..."
+          Start-Sleep -Seconds 15
+          
+          # Extract the URL - try multiple patterns
+          $tunnelUrl = wsl bash -c "grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1"
           
           if (-not $tunnelUrl) {
-            Write-Host "Failed to get tunnel URL. Checking log content:"
-            wsl bash -c "cat /tmp/tunnel.log 2>/dev/null"
-            
-            # Try alternative method to start tunnel
-            Write-Host "Trying alternative tunnel start method..."
-            wsl bash -c "pkill cloudflared 2>/dev/null; sleep 2"
-            wsl bash -c "cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel2.log 2>&1 &"
+            Write-Host "First attempt failed, trying again..."
             Start-Sleep -Seconds 10
-            $tunnelUrl = wsl bash -c "cat /tmp/tunnel2.log 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -n 1"
+            $tunnelUrl = wsl bash -c "grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1"
           }
           
           if ($tunnelUrl) {
             Write-Host "Tunnel URL: $tunnelUrl"
             echo "TUNNEL_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
           } else {
-            Write-Host "WARNING: Could not establish Cloudflare tunnel" -ForegroundColor Red
-            Write-Host "Guacamole is running on localhost:8080 but not accessible externally"
+            Write-Host "Could not extract URL, showing full tunnel log:"
+            wsl bash -c "cat /tmp/tunnel.log"
           }
 
-      - name: Display Connection Information
+      - name: Display Access Information
         shell: pwsh
         run: |
+          Write-Host ""
           Write-Host "========================================================" -ForegroundColor Green
-          Write-Host "APACHE GUACAMOLE WEB INTERFACE" -ForegroundColor Green
+          Write-Host "🌐 BROWSER-BASED WINDOWS RDP ACCESS" -ForegroundColor Green
           Write-Host "========================================================" -ForegroundColor Green
+          Write-Host ""
           
           if ($env:TUNNEL_URL) {
+            $fullUrl = "$env:TUNNEL_URL/guacamole"
+            Write-Host "🔗 ACCESS URL:" -ForegroundColor Yellow
+            Write-Host "   $fullUrl" -ForegroundColor Cyan
             Write-Host ""
-            Write-Host "ACCESS URL:" -ForegroundColor Yellow
-            Write-Host "$env:TUNNEL_URL/guacamole" -ForegroundColor Cyan
+            Write-Host "📋 LOGIN DETAILS:" -ForegroundColor Yellow
+            Write-Host "   Guacamole Username: guacadmin" -ForegroundColor White
+            Write-Host "   Guacamole Password: guacadmin" -ForegroundColor White
+            Write-Host ""
+            Write-Host "💻 WINDOWS RDP (auto-filled):" -ForegroundColor Yellow
+            Write-Host "   Username: runneradmin" -ForegroundColor White
+            Write-Host "   Password: RunnerPass123!" -ForegroundColor White
+            Write-Host ""
+            Write-Host "📝 STEPS:" -ForegroundColor Yellow
+            Write-Host "   1. Open the URL above in your browser" -ForegroundColor White
+            Write-Host "   2. Login with guacadmin / guacadmin" -ForegroundColor White
+            Write-Host "   3. Click on 'GitHub Windows Runner' connection" -ForegroundColor White
+            Write-Host "   4. You'll see the Windows desktop in your browser!" -ForegroundColor White
           } else {
+            Write-Host "⚠️  Tunnel URL not available" -ForegroundColor Red
+            Write-Host "Checking if services are running..." -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "WARNING: Cloudflare tunnel URL not available" -ForegroundColor Red
-            Write-Host "Checking current tunnel logs for debug:" -ForegroundColor Yellow
-            wsl bash -c "cat /tmp/tunnel.log 2>/dev/null || cat /tmp/tunnel2.log 2>/dev/null"
+            wsl bash -c "sudo docker ps"
+            Write-Host ""
+            wsl bash -c "cat /tmp/tunnel.log 2>/dev/null"
           }
           
           Write-Host ""
-          Write-Host "GUACAMOLE LOGIN:" -ForegroundColor Yellow
-          Write-Host "Username: guacadmin" -ForegroundColor White
-          Write-Host "Password: guacadmin" -ForegroundColor White
-          Write-Host ""
-          Write-Host "WINDOWS RDP CREDENTIALS:" -ForegroundColor Yellow
-          Write-Host "Username: runneradmin" -ForegroundColor White
-          Write-Host "Password: RunnerPass123!" -ForegroundColor White
-          Write-Host ""
-          Write-Host "INSTRUCTIONS:" -ForegroundColor Yellow
-          Write-Host "1. Open the Guacamole URL in your browser" -ForegroundColor White
-          Write-Host "2. Log in with the Guacamole credentials above" -ForegroundColor White
-          Write-Host "3. Click on 'Windows Runner RDP' to connect to the Windows desktop" -ForegroundColor White
-          Write-Host "4. Use runneradmin / RunnerPass123! to log into Windows" -ForegroundColor White
+          Write-Host "⏱️  Session will remain active for up to 6 hours" -ForegroundColor Green
           Write-Host "========================================================" -ForegroundColor Green
+          Write-Host ""
 
       - name: Keep Session Alive
         shell: pwsh
         run: |
-          Write-Host ""
-          Write-Host "========================================================" -ForegroundColor Green
-          Write-Host "SESSION ACTIVE - Keep this window open" -ForegroundColor Green
-          Write-Host "========================================================" -ForegroundColor Green
-          Write-Host "The session will remain active for up to 6 hours."
-          Write-Host "Press Ctrl+C in the Actions log to end early."
-          Write-Host "========================================================" -ForegroundColor Green
-          Write-Host ""
-          
-          $jobTimeout = 350 * 60  # 350 minutes
+          $timeout = 350 * 60  # 350 minutes
           $startTime = Get-Date
-          $lastStatus = 0
+          $lastUpdate = 0
           
           while ($true) {
             $elapsed = ((Get-Date) - $startTime).TotalSeconds
             
-            if ($elapsed -gt $jobTimeout) {
-              Write-Host "Maximum session time reached. Shutting down..."
+            if ($elapsed -ge $timeout) {
+              Write-Host "Maximum session duration reached."
               break
             }
             
-            # Show status every 2 minutes
-            if ($elapsed - $lastStatus -ge 120) {
-              $remaining = [math]::Round(($jobTimeout - $elapsed) / 60)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $remaining minutes remaining" -ForegroundColor Cyan
-              $lastStatus = $elapsed
-              
-              # Check if services are still running
-              $guacdRunning = wsl bash -c "sudo docker ps --filter name=guacd --format '{{.Status}}' 2>/dev/null"
-              $guacRunning = wsl bash -c "sudo docker ps --filter name=guacamole --format '{{.Status}}' 2>/dev/null"
-              $tunnelRunning = wsl bash -c "pgrep cloudflared > /dev/null 2>&1 && echo 'Running' || echo 'Not running'"
-              
-              Write-Host "  guacd: $guacdRunning" -ForegroundColor Gray
-              Write-Host "  guacamole: $guacRunning" -ForegroundColor Gray
-              Write-Host "  cloudflared: $tunnelRunning" -ForegroundColor Gray
+            # Update every 2 minutes
+            if ($elapsed - $lastUpdate -ge 120) {
+              $remaining = [math]::Round(($timeout - $elapsed) / 60)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Windows RDP session active - $remaining minutes remaining" -ForegroundColor Cyan
+              $lastUpdate = $elapsed
             }
             
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 30
           }
