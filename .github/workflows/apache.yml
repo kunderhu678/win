@@ -1,0 +1,102 @@
+name: Windows 10 Pro RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-windows-guacamole:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify KVM Support
+        run: |
+          echo "Checking for Hardware Virtualization Support..."
+          sudo apt-get update && sudo apt-get install -y qemu-kvm
+          ls -l /dev/kvm || echo "KVM not available, falling back to software emulation."
+
+      - name: Create Docker Network
+        run: docker network create vm-net
+
+      - name: Start Windows 10 Pro Container
+        run: |
+          docker run -d \
+            --name windows \
+            --network vm-net \
+            --device=/dev/kvm \
+            --cap-add NET_ADMIN \
+            -e VERSION="win10" \
+            -e RAM_SIZE="10G" \
+            -e CPU_CORES="4" \
+            dockurr/windows
+
+      - name: Setup Apache Guacamole Stack
+        run: |
+          echo "Creating Guacamole Configuration..."
+          mkdir -p config
+          cat << 'EOF' > config/user-mapping.xml
+          <user-mapping>
+              <authorize username="guacadmin" password="guacadmin">
+                  <connection name="Windows 10 LTSC">
+                      <protocol>rdp</protocol>
+                      <param name="hostname">windows</param>
+                      <param name="port">3389</param>
+                      <param name="security">any</param>
+                      <param name="ignore-cert">true</param>
+                      <param name="username">docker</param>
+                      <param name="password"></param>
+                  </connection>
+              </authorize>
+          </user-mapping>
+          EOF
+          
+          echo "Starting guacd (Guacamole Proxy)..."
+          docker run -d --name guacd --network vm-net guacamole/guacd
+          
+          echo "Starting Guacamole Web Client..."
+          # Mounting the config folder so Guacamole reads user-mapping.xml
+          docker run -d \
+            --name guacamole \
+            --network vm-net \
+            -e GUACD_HOSTNAME=guacd \
+            -e GUACD_PORT=4822 \
+            -v ${{ github.workspace }}/config:/etc/guacamole \
+            -p 8080:8080 \
+            guacamole/guacamole
+
+      - name: Setup Cloudflare Tunnel (HTTPS for Web Browser)
+        run: |
+          echo "Downloading Cloudflare Tunnel..."
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          
+          echo "Starting HTTPS tunnel to Guacamole on port 8080..."
+          cloudflared tunnel --url http://localhost:8080 > tunnel.log 2>&1 &
+          
+          # Give the tunnel a moment to generate the URL
+          sleep 5
+          
+          echo "========================================================"
+          echo "🌐 APACHE GUACAMOLE WEB ADDRESS:"
+          TUNNEL_URL=$(cat tunnel.log | grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com')
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ ERROR: Cloudflare tunnel failed to start. Printing log:"
+            cat tunnel.log
+          else
+            echo "Link: $TUNNEL_URL/guacamole"
+            echo ""
+            echo "👤 Guacamole Login: guacadmin"
+            echo "🔑 Guacamole Password: guacadmin"
+            echo "========================================================"
+            echo "⚠️ NOTE ON TIMING:"
+            echo "Windows takes 15-20 minutes to install in the background."
+            echo "You can log into the Guacamole web UI immediately, but"
+            echo "clicking the VM connection will result in a 'Connection Error'"
+            echo "until Windows is fully booted and the RDP port is open."
+          fi
+          echo "========================================================"
+
+      - name: Monitor Installation and System Logs
+        run: |
+          echo "Tailing Dockur logs to monitor Windows installation progress..."
+          echo "Keep this window open to keep the GitHub Actions runner alive."
+          docker logs -f windows
