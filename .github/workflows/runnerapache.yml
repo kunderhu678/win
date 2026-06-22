@@ -109,11 +109,11 @@ jobs:
           }
           
           Write-Host "========================================================"
-          Write-Host "🌐 APACHE GUACAMOLE WEB ADDRESS:"
+          Write-Host "APACHE GUACAMOLE WEB ADDRESS:"
           Write-Host "Link: $TunnelUrl/guacamole/"
           Write-Host ""
-          Write-Host "👤 Guacamole Login: guacadmin"
-          Write-Host "🔑 Guacamole Password: guacadmin"
+          Write-Host "Guacamole Login: guacadmin"
+          Write-Host "Guacamole Password: guacadmin"
           Write-Host "========================================================"
 
       - name: Keep Runner Session Alive
