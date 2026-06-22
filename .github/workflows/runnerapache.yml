@@ -91,12 +91,12 @@ jobs:
           Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:8080" -RedirectStandardError "tunnel.log" -NoNewWindow
           
           # Give Cloudflare a moment to register a public domain assignment
-          Start-Sleep -Seconds 12
+          Start-Sleep -Seconds 15
           
-          # Extract the URL from the logging track
+          # Extract the URL using -Raw to handle the log as a single string block
           $TunnelUrl = ""
           if (Test-Path "tunnel.log") {
-              $LogContent = Get-Content "tunnel.log"
+              $LogContent = Get-Content "tunnel.log" -Raw
               if ($LogContent -match "https://[-a-zA-Z0-9]*\.trycloudflare\.com") {
                   $TunnelUrl = $Matches[0]
               }
