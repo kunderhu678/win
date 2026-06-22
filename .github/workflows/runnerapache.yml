@@ -81,9 +81,17 @@ jobs:
               restart: always
           EOF
 
-          echo "Launching core services..."
+          echo "Staging Deployment Strategy..."
           cd /etc/guacamole
-          docker compose up -d
+          
+          echo "Bringing up database cluster..."
+          docker compose up -d postgres
+          
+          echo "Allowing schema ingestion processing (20 seconds)..."
+          sleep 20
+          
+          echo "Launching dependent web and routing daemons..."
+          docker compose up -d guacd guacamole
           '@
 
           $setupScript = $setupScript -replace "`r", ""
@@ -95,7 +103,7 @@ jobs:
         run: |
           echo "Verifying local application endpoint health (Polling port 8080)..."
           $LocalReady = $false
-          for ($i = 1; $i -le 45; $i++) {
+          for ($i = 1; $i -le 60; $i++) {
               try {
                   $Response = Invoke-WebRequest -Uri "http://127.0.0.1:8080/guacamole/" -Method Head -TimeoutSec 2 -ErrorAction SilentlyContinue
                   if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 302) {
@@ -103,14 +111,23 @@ jobs:
                       break
                   }
               } catch {
-                  # Waiting for Java servlet compilation & startup sequence
+                  # Waiting on servlet startup mapping lifecycle
               }
               Start-Sleep -Seconds 2
           }
 
           if (-not $LocalReady) {
-              Write-Error "Guacamole web dashboard failed to reply on port 8080. Diagnostic dumping:"
+              Write-Host "================= DIAGNOSTIC ENGINE LOG DUMP ================="
+              Write-Host "CONTAINER COMPONENT STATES:"
               wsl docker ps -a
+              Write-Host ""
+              Write-Host "GUACAMOLE WEB LOGS:"
+              wsl docker logs guac-web --tail 40
+              Write-Host ""
+              Write-Host "POSTGRES DB LOGS:"
+              wsl docker logs guac-postgres --tail 40
+              Write-Host "==============================================================="
+              Write-Error "Guacamole web dashboard failed to reply on port 8080."
               exit 1
           }
 
@@ -142,8 +159,9 @@ jobs:
               exit 1
           }
           
-          # Compute host gateway endpoint cleanly via the WSL network bridge
-          $WindowsIP = (wsl ip route | Select-String "default").Line.Split(' ')[2]
+          # Compute host gateway endpoint cleanly via standard regex routing extraction
+          $WslRoute = wsl ip route | Select-String "default"
+          $WindowsIP = [regex]::Match($WslRoute, '(?<=via\s)[0-9\.]+').Value
           
           Write-Host "========================================================"
           Write-Host "APACHE GUACAMOLE CONNECTIVITY PORTAL"
