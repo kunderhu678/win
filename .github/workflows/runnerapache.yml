@@ -81,14 +81,14 @@ jobs:
           [System.IO.File]::WriteAllText("C:\setup_guac.sh", $bashScript)
           wsl -u root bash /mnt/c/setup_guac.sh
 
-      - name: Deploy Cloudflare Tunnel (trycloudflare)
+      - name: Deploy Cloudflare Tunnel & Keep Session Alive
         shell: powershell
         run: |
           echo "Downloading Cloudflare Binary..."
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe"
           
           echo "Initializing secure tunnel to Guacamole..."
-          # Merges stdout and stderr safely into tunnel.log using cmd native redirection
+          # Merges stdout and stderr safely into tunnel.log
           Start-Process cmd -ArgumentList "/c .\cloudflared.exe tunnel --url http://localhost:8080 > tunnel.log 2>&1" -NoNewWindow
           
           echo "Waiting for Cloudflare to generate tunnel URL (polling up to 45 seconds)..."
@@ -100,7 +100,7 @@ jobs:
               if (Test-Path "tunnel.log") {
                   $LogContent = Get-Content "tunnel.log" -Raw -ErrorAction SilentlyContinue
                   if ($LogContent) {
-                      # Native .NET Regex matching bypasses PowerShell array parsing limitations
+                      # Native .NET Regex matching
                       $RegexMatch = [regex]::Match([string]$LogContent, "https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
                       if ($RegexMatch.Success) {
                           $TunnelUrl = $RegexMatch.Value
@@ -129,17 +129,14 @@ jobs:
           Write-Host "Guacamole Login: guacadmin"
           Write-Host "Guacamole Password: guacadmin"
           Write-Host "========================================================"
-
-      - name: Keep Runner Session Alive
-        shell: powershell
-        run: |
+          
           Write-Host "System is active. Connection loop is monitoring live states."
           Write-Host "To end this session, cancel the workflow run manually."
           
-          # Standard maximum execution loop (6 hours / 360 minutes max runner time limit)
-          for ($i = 1; $i -le 360; $i++) {
+          # Standard maximum execution loop inside the SAME step to protect the tunnel process
+          for ($k = 1; $k -le 360; $k++) {
               Start-Sleep -Seconds 60
-              if (($i % 10) -eq 0) {
-                  Write-Host "Session active check: $i minutes elapsed."
+              if (($k % 10) -eq 0) {
+                  Write-Host "Session active check: $k minutes elapsed."
               }
           }
