@@ -1,0 +1,148 @@
+name: Windows RDP via Guacamole
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-rdp-guacamole:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Configure Windows for RDP
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Set RDP security layer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
+          
+          # Create a user for RDP access
+          $password = ConvertTo-SecureString "RunnerPass123!" -AsPlainText -Force
+          New-LocalUser -Name "runneradmin" -Password $password -FullName "Runner Admin" -Description "RDP Access User"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin"
+          Add-LocalGroupMember -Group "Administrators" -Member "runneradmin"
+          
+          # Get the runner's password for display
+          echo "RDP Credentials - Username: runneradmin, Password: RunnerPass123!"
+          
+          # Restart RDP service
+          Restart-Service TermService -Force
+          
+          # Display IP address
+          $ipAddress = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "*Loopback*"}).IPAddress
+          echo "Windows RDP is ready on IP: $ipAddress"
+
+      - name: Install WSL and Docker
+        run: |
+          # Install WSL
+          wsl --install -d Ubuntu
+          wsl --update
+          
+          # Wait for WSL to be ready
+          Start-Sleep -Seconds 30
+          
+          # Install Docker in WSL
+          wsl bash -c "curl -fsSL https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh"
+          wsl bash -c "sudo service docker start"
+          
+          echo "Docker installed in WSL"
+
+      - name: Setup Guacamole in WSL
+        run: |
+          # Create Guacamole configuration directory
+          wsl bash -c "mkdir -p ~/guacamole/config"
+          
+          # Create user-mapping.xml with Windows RDP connection
+          wsl bash -c 'cat > ~/guacamole/config/user-mapping.xml << EOF
+          <user-mapping>
+              <authorize username="guacadmin" password="guacadmin">
+                  <connection name="Windows Runner">
+                      <protocol>rdp</protocol>
+                      <param name="hostname">host.docker.internal</param>
+                      <param name="port">3389</param>
+                      <param name="security">any</param>
+                      <param name="ignore-cert">true</param>
+                      <param name="username">runneradmin</param>
+                      <param name="password">RunnerPass123!</param>
+                  </connection>
+              </authorize>
+          </user-mapping>
+          EOF'
+          
+          # Start Guacamole daemon
+          wsl bash -c "docker run -d --name guacd --restart unless-stopped guacamole/guacd"
+          
+          # Start Guacamole web client
+          wsl bash -c "docker run -d --name guacamole --restart unless-stopped `
+            -e GUACD_HOSTNAME=guacd `
+            -e GUACD_PORT=4822 `
+            -v ~/guacamole/config:/etc/guacamole `
+            --link guacd:guacd `
+            -p 8080:8080 `
+            guacamole/guacamole"
+          
+          echo "Guacamole is running on port 8080"
+
+      - name: Setup Cloudflare Tunnel
+        run: |
+          # Download cloudflared in WSL
+          wsl bash -c "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+          wsl bash -c "sudo dpkg -i cloudflared-linux-amd64.deb"
+          
+          # Start Cloudflare tunnel in background
+          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 > ~/tunnel.log 2>&1 &"
+          
+          # Wait for tunnel URL
+          Start-Sleep -Seconds 10
+          
+          # Extract and display the tunnel URL
+          wsl bash -c 'echo "========================================================"
+          echo "🌐 APACHE GUACAMOLE WEB ADDRESS:"
+          TUNNEL_URL=$(grep -o "https://[-a-zA-Z0-9]*\.trycloudflare\.com" ~/tunnel.log || echo "")
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Checking tunnel log..."
+            cat ~/tunnel.log
+          else
+            echo "Guacamole URL: $TUNNEL_URL/guacamole"
+            echo ""
+            echo "👤 Login: guacadmin"
+            echo "🔑 Password: guacadmin"
+            echo ""
+            echo "💻 RDP Credentials:"
+            echo "   Username: runneradmin"
+            echo "   Password: RunnerPass123!"
+            echo "========================================================"
+          fi'
+          
+          # Also display tunnel info from Windows side
+          wsl bash -c 'cat ~/tunnel.log' 2>$null
+
+      - name: Keep Runner Alive
+        run: |
+          # Create a file to keep the runner alive
+          $jobTimeout = 350 * 60  # 350 minutes in seconds
+          $startTime = Get-Date
+          
+          echo "========================================================"
+          echo "✅ Windows RDP is ready!"
+          echo "The session will remain active for up to 6 hours."
+          echo "========================================================"
+          
+          while ($true) {
+            $elapsed = ((Get-Date) - $startTime).TotalSeconds
+            if ($elapsed -gt $jobTimeout) {
+              echo "Job timeout reached. Shutting down..."
+              break
+            }
+            
+            # Display status every 5 minutes
+            if ([math]::Round($elapsed) % 300 -eq 0) {
+              $remaining = [math]::Round(($jobTimeout - $elapsed) / 60)
+              echo "Session active - $remaining minutes remaining"
+            }
+            
+            Start-Sleep -Seconds 30
+          }
