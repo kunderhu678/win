@@ -42,67 +42,88 @@ jobs:
           wsl --set-default-version 2
           Write-Host "WSL installed"
 
-      - name: Setup Docker and Guacamole in WSL
+      - name: Setup Docker in WSL
         shell: pwsh
         run: |
-          # Create setup commands
-          $commands = @(
-            "sudo apt-get update -qq",
-            "curl -fsSL https://get.docker.com | sudo sh",
-            "sudo service docker start",
-            "sudo usermod -aG docker root",
-            "mkdir -p /root/guacamole/config",
-            "cat > /root/guacamole/config/user-mapping.xml << 'EOF'",
-            "<user-mapping>",
-            "    <authorize username=\"guacadmin\" password=\"guacadmin\">",
-            "        <connection name=\"Windows Runner RDP\">",
-            "            <protocol>rdp</protocol>",
-            "            <param name=\"hostname\">host.docker.internal</param>",
-            "            <param name=\"port\">3389</param>",
-            "            <param name=\"security\">any</param>",
-            "            <param name=\"ignore-cert\">true</param>",
-            "            <param name=\"username\">runneradmin</param>",
-            "            <param name=\"password\">RunnerPass123!</param>",
-            "        </connection>",
-            "    </authorize>",
-            "</user-mapping>",
-            "EOF",
-            "docker run -d --name guacd --restart unless-stopped guacamole/guacd",
-            "docker run -d --name guacamole --restart unless-stopped -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -v /root/guacamole/config:/etc/guacamole --link guacd:guacd -p 8080:8080 guacamole/guacamole",
-            "echo 'Guacamole setup complete'",
-            "sleep 10",
-            "curl -s http://localhost:8080/guacamole/ | head -n 5"
-          )
+          Write-Host "Installing Docker..."
+          wsl bash -c "sudo apt-get update -qq"
+          wsl bash -c "curl -fsSL https://get.docker.com | sudo sh"
+          wsl bash -c "sudo service docker start"
+          Write-Host "Docker installed and started"
+
+      - name: Create Guacamole Configuration
+        shell: pwsh
+        run: |
+          Write-Host "Creating Guacamole configuration..."
           
-          # Execute each command in WSL
-          foreach ($cmd in $commands) {
-            Write-Host "Executing: $cmd"
-            wsl bash -c $cmd
-            Start-Sleep -Seconds 1
-          }
+          # Create directory
+          wsl bash -c "sudo mkdir -p /etc/guacamole"
           
-          Write-Host "Docker and Guacamole setup complete!"
+          # Create user-mapping.xml with proper escaping
+          $xmlContent = @'
+<user-mapping>
+    <authorize username="guacadmin" password="guacadmin">
+        <connection name="Windows Runner RDP">
+            <protocol>rdp</protocol>
+            <param name="hostname">host.docker.internal</param>
+            <param name="port">3389</param>
+            <param name="security">any</param>
+            <param name="ignore-cert">true</param>
+            <param name="username">runneradmin</param>
+            <param name="password">RunnerPass123!</param>
+        </connection>
+    </authorize>
+</user-mapping>
+'@
+          
+          # Save XML to a temp file and copy to WSL
+          $xmlPath = "$env:TEMP\user-mapping.xml"
+          $xmlContent | Out-File -FilePath $xmlPath -Encoding ASCII
+          
+          # Copy to WSL
+          $wslPath = $xmlPath -replace '\\', '/' -replace 'C:', '/mnt/c'
+          wsl bash -c "sudo cp $wslPath /etc/guacamole/user-mapping.xml"
+          
+          Write-Host "Guacamole configuration created"
+
+      - name: Start Guacamole Daemon
+        shell: pwsh
+        run: |
+          Write-Host "Starting guacd..."
+          wsl bash -c "sudo docker run -d --name guacd --restart unless-stopped guacamole/guacd"
+          Write-Host "guacd started"
+
+      - name: Start Guacamole Web Client
+        shell: pwsh
+        run: |
+          Write-Host "Starting Guacamole web client..."
+          wsl bash -c "sudo docker run -d --name guacamole --restart unless-stopped -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -v /etc/guacamole:/etc/guacamole --link guacd:guacd -p 8080:8080 guacamole/guacamole"
+          Start-Sleep -Seconds 5
+          Write-Host "Guacamole web client started"
+          
+          # Test if it's running
+          wsl bash -c "curl -s http://localhost:8080/guacamole/ | head -n 3"
 
       - name: Setup Cloudflare Tunnel
         shell: pwsh
         run: |
-          # Install cloudflared
+          Write-Host "Installing Cloudflare tunnel..."
           wsl bash -c "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
           wsl bash -c "sudo dpkg -i cloudflared-linux-amd64.deb"
           
-          # Start tunnel in background
-          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 > /root/tunnel.log 2>&1 &"
+          Write-Host "Starting Cloudflare tunnel..."
+          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel.log 2>&1 &"
           
           Write-Host "Waiting for tunnel to establish..."
           Start-Sleep -Seconds 15
           
           # Extract tunnel URL
-          $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /root/tunnel.log | head -n 1"
+          $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/tunnel.log | head -n 1"
           
           if (-not $tunnelUrl) {
             Write-Host "Waiting additional time for tunnel..."
             Start-Sleep -Seconds 10
-            $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /root/tunnel.log | head -n 1"
+            $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/tunnel.log | head -n 1"
           }
           
           Write-Host "Tunnel URL: $tunnelUrl"
@@ -119,7 +140,7 @@ jobs:
             Write-Host "URL: $env:TUNNEL_URL/guacamole" -ForegroundColor Cyan
           } else {
             Write-Host "Tunnel URL not found. Checking logs..." -ForegroundColor Yellow
-            wsl bash -c "cat /root/tunnel.log"
+            wsl bash -c "cat /tmp/tunnel.log"
           }
           
           Write-Host ""
