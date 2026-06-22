@@ -59,7 +59,7 @@ jobs:
           # Create directory
           wsl bash -c "sudo mkdir -p /etc/guacamole"
           
-          # Create user-mapping.xml with proper escaping
+          # Create user-mapping.xml
           $xmlContent = @'
 <user-mapping>
     <authorize username="guacadmin" password="guacadmin">
@@ -78,11 +78,12 @@ jobs:
           
           # Save XML to a temp file and copy to WSL
           $xmlPath = "$env:TEMP\user-mapping.xml"
-          $xmlContent | Out-File -FilePath $xmlPath -Encoding ASCII
+          $xmlContent | Out-File -FilePath $xmlPath -Encoding ASCII -NoNewline
           
           # Copy to WSL
           $wslPath = $xmlPath -replace '\\', '/' -replace 'C:', '/mnt/c'
-          wsl bash -c "sudo cp $wslPath /etc/guacamole/user-mapping.xml"
+          wsl bash -c "sudo cp '$wslPath' /etc/guacamole/user-mapping.xml"
+          wsl bash -c "sudo chmod 644 /etc/guacamole/user-mapping.xml"
           
           Write-Host "Guacamole configuration created"
 
@@ -91,7 +92,11 @@ jobs:
         run: |
           Write-Host "Starting guacd..."
           wsl bash -c "sudo docker run -d --name guacd --restart unless-stopped guacamole/guacd"
-          Write-Host "guacd started"
+          Start-Sleep -Seconds 3
+          
+          # Verify guacd is running
+          $guacdStatus = wsl bash -c "sudo docker ps --filter name=guacd --format '{{.Status}}'"
+          Write-Host "guacd status: $guacdStatus"
 
       - name: Start Guacamole Web Client
         shell: pwsh
@@ -99,10 +104,14 @@ jobs:
           Write-Host "Starting Guacamole web client..."
           wsl bash -c "sudo docker run -d --name guacamole --restart unless-stopped -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -v /etc/guacamole:/etc/guacamole --link guacd:guacd -p 8080:8080 guacamole/guacamole"
           Start-Sleep -Seconds 5
-          Write-Host "Guacamole web client started"
           
-          # Test if it's running
-          wsl bash -c "curl -s http://localhost:8080/guacamole/ | head -n 3"
+          # Verify guacamole is running
+          $guacStatus = wsl bash -c "sudo docker ps --filter name=guacamole --format '{{.Status}}'"
+          Write-Host "Guacamole status: $guacStatus"
+          
+          # Test connectivity
+          Write-Host "Testing Guacamole web interface..."
+          wsl bash -c "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/guacamole/"
 
       - name: Setup Cloudflare Tunnel
         shell: pwsh
@@ -111,23 +120,50 @@ jobs:
           wsl bash -c "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
           wsl bash -c "sudo dpkg -i cloudflared-linux-amd64.deb"
           
-          Write-Host "Starting Cloudflare tunnel..."
-          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel.log 2>&1 &"
+          Write-Host "Starting Cloudflare tunnel in background..."
+          # Start tunnel and redirect output to a file
+          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 2>&1 | tee /tmp/tunnel.log &"
           
-          Write-Host "Waiting for tunnel to establish..."
-          Start-Sleep -Seconds 15
+          Write-Host "Waiting for tunnel URL to appear..."
           
-          # Extract tunnel URL
-          $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/tunnel.log | head -n 1"
+          # Wait and check for the URL multiple times
+          $tunnelUrl = $null
+          $maxAttempts = 12
+          $attempt = 0
           
-          if (-not $tunnelUrl) {
-            Write-Host "Waiting additional time for tunnel..."
-            Start-Sleep -Seconds 10
-            $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/tunnel.log | head -n 1"
+          while ($attempt -lt $maxAttempts -and -not $tunnelUrl) {
+            $attempt++
+            Write-Host "Attempt $attempt of $maxAttempts..."
+            Start-Sleep -Seconds 5
+            
+            # Try to extract the URL
+            $tunnelUrl = wsl bash -c "cat /tmp/tunnel.log 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -n 1"
+            
+            if ($tunnelUrl) {
+              Write-Host "Tunnel URL found: $tunnelUrl"
+              break
+            }
           }
           
-          Write-Host "Tunnel URL: $tunnelUrl"
-          echo "TUNNEL_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if (-not $tunnelUrl) {
+            Write-Host "Failed to get tunnel URL. Checking log content:"
+            wsl bash -c "cat /tmp/tunnel.log 2>/dev/null"
+            
+            # Try alternative method to start tunnel
+            Write-Host "Trying alternative tunnel start method..."
+            wsl bash -c "pkill cloudflared 2>/dev/null; sleep 2"
+            wsl bash -c "cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel2.log 2>&1 &"
+            Start-Sleep -Seconds 10
+            $tunnelUrl = wsl bash -c "cat /tmp/tunnel2.log 2>/dev/null | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -n 1"
+          }
+          
+          if ($tunnelUrl) {
+            Write-Host "Tunnel URL: $tunnelUrl"
+            echo "TUNNEL_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            Write-Host "WARNING: Could not establish Cloudflare tunnel" -ForegroundColor Red
+            Write-Host "Guacamole is running on localhost:8080 but not accessible externally"
+          }
 
       - name: Display Connection Information
         shell: pwsh
@@ -137,10 +173,14 @@ jobs:
           Write-Host "========================================================" -ForegroundColor Green
           
           if ($env:TUNNEL_URL) {
-            Write-Host "URL: $env:TUNNEL_URL/guacamole" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "ACCESS URL:" -ForegroundColor Yellow
+            Write-Host "$env:TUNNEL_URL/guacamole" -ForegroundColor Cyan
           } else {
-            Write-Host "Tunnel URL not found. Checking logs..." -ForegroundColor Yellow
-            wsl bash -c "cat /tmp/tunnel.log"
+            Write-Host ""
+            Write-Host "WARNING: Cloudflare tunnel URL not available" -ForegroundColor Red
+            Write-Host "Checking current tunnel logs for debug:" -ForegroundColor Yellow
+            wsl bash -c "cat /tmp/tunnel.log 2>/dev/null || cat /tmp/tunnel2.log 2>/dev/null"
           }
           
           Write-Host ""
@@ -154,16 +194,24 @@ jobs:
           Write-Host ""
           Write-Host "INSTRUCTIONS:" -ForegroundColor Yellow
           Write-Host "1. Open the Guacamole URL in your browser" -ForegroundColor White
-          Write-Host "2. Log in with the credentials above" -ForegroundColor White
-          Write-Host "3. Click on 'Windows Runner RDP' to connect" -ForegroundColor White
+          Write-Host "2. Log in with the Guacamole credentials above" -ForegroundColor White
+          Write-Host "3. Click on 'Windows Runner RDP' to connect to the Windows desktop" -ForegroundColor White
+          Write-Host "4. Use runneradmin / RunnerPass123! to log into Windows" -ForegroundColor White
           Write-Host "========================================================" -ForegroundColor Green
 
       - name: Keep Session Alive
         shell: pwsh
         run: |
-          Write-Host "Session will remain active for up to 6 hours" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "========================================================" -ForegroundColor Green
+          Write-Host "SESSION ACTIVE - Keep this window open" -ForegroundColor Green
+          Write-Host "========================================================" -ForegroundColor Green
+          Write-Host "The session will remain active for up to 6 hours."
+          Write-Host "Press Ctrl+C in the Actions log to end early."
+          Write-Host "========================================================" -ForegroundColor Green
+          Write-Host ""
           
-          $jobTimeout = 350 * 60
+          $jobTimeout = 350 * 60  # 350 minutes
           $startTime = Get-Date
           $lastStatus = 0
           
@@ -171,14 +219,24 @@ jobs:
             $elapsed = ((Get-Date) - $startTime).TotalSeconds
             
             if ($elapsed -gt $jobTimeout) {
-              Write-Host "Timeout reached. Shutting down..."
+              Write-Host "Maximum session time reached. Shutting down..."
               break
             }
             
+            # Show status every 2 minutes
             if ($elapsed - $lastStatus -ge 120) {
               $remaining = [math]::Round(($jobTimeout - $elapsed) / 60)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $remaining minutes remaining" -ForegroundColor Cyan
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $remaining minutes remaining" -ForegroundColor Cyan
               $lastStatus = $elapsed
+              
+              # Check if services are still running
+              $guacdRunning = wsl bash -c "sudo docker ps --filter name=guacd --format '{{.Status}}' 2>/dev/null"
+              $guacRunning = wsl bash -c "sudo docker ps --filter name=guacamole --format '{{.Status}}' 2>/dev/null"
+              $tunnelRunning = wsl bash -c "pgrep cloudflared > /dev/null 2>&1 && echo 'Running' || echo 'Not running'"
+              
+              Write-Host "  guacd: $guacdRunning" -ForegroundColor Gray
+              Write-Host "  guacamole: $guacRunning" -ForegroundColor Gray
+              Write-Host "  cloudflared: $tunnelRunning" -ForegroundColor Gray
             }
             
             Start-Sleep -Seconds 15
