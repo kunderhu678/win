@@ -47,7 +47,8 @@ jobs:
 
           echo "Preparing database migration files..."
           mkdir -p /etc/guacamole/init
-          docker run --rm guacamole/guacamole:latest /opt/guacamole/bin/initdb.sh --postgres > /etc/guacamole/init/initdb.sql
+          # FIXED: Swapped out --postgres for the strictly required --postgresql argument
+          docker run --rm guacamole/guacamole:latest /opt/guacamole/bin/initdb.sh --postgresql > /etc/guacamole/init/initdb.sql
 
           echo "Generating deployment blueprint..."
           cat << EOF > /etc/guacamole/docker-compose.yml
@@ -144,8 +145,8 @@ jobs:
               exit 1
           }
           
-          # Compute host gateway endpoint for network traversal inside Guacamole
-          $WindowsIP = wsl exec ip route | Select-String "default" | ForEach-Object { $_.Line.Split(' ')[2] }
+          # Compute host gateway endpoint cleanly via the WSL network bridge
+          $WindowsIP = (wsl ip route | Select-String "default").Line.Split(' ')[2]
           
           Write-Host "========================================================"
           Write-Host "APACHE GUACAMOLE CONNECTIVITY PORTAL"
