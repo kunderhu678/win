@@ -31,76 +31,104 @@ jobs:
       - name: Setup Apache Guacamole Stack inside WSL
         shell: powershell
         run: |
-          $bashScript = @'
-          # Update and install Docker prerequisites
-          apt-get update && apt-get install -y curl iptables
+          $setupScript = @'
+          #!/bin/bash
+          set -e
+
+          echo "Installing Docker stack components..."
+          apt-get update && apt-get install -y curl iptables docker-compose-v2
           
-          # Force legacy iptables to ensure Docker works smoothly inside WSL2
+          echo "Configuring legacy iptables for container routing..."
           update-alternatives --set iptables /usr/sbin/iptables-legacy || true
           
-          # Install Docker CE
-          curl -fsSL https://get.docker.com -o get-docker.sh
-          sh get-docker.sh
+          echo "Starting Docker Engine..."
           service docker start
-          
-          # Dynamically fetch the Windows Host Gateway IP from WSL
-          WINDOWS_HOST=$(ip route | grep default | awk '{print $3}')
-          echo "Windows Host Interface detected at: $WINDOWS_HOST"
-          
-          # Configure Guacamole User Mapping
-          mkdir -p /etc/guacamole
-          cat << EOF > /etc/guacamole/user-mapping.xml
-          <user-mapping>
-              <authorize username="guacadmin" password="guacadmin">
-                  <connection name="Windows Runner Native">
-                      <protocol>rdp</protocol>
-                      <param name="hostname">$WINDOWS_HOST</param>
-                      <param name="port">3389</param>
-                      <param name="security">any</param>
-                      <param name="ignore-cert">true</param>
-                      <param name="username">runneradmin</param>
-                      <param name="password">GuacWinPass123!</param>
-                  </connection>
-              </authorize>
-          </user-mapping>
+          sleep 5
+
+          echo "Preparing database migration files..."
+          mkdir -p /etc/guacamole/init
+          docker run --rm guacamole/guacamole:latest /opt/guacamole/bin/initdb.sh --postgres > /etc/guacamole/init/initdb.sql
+
+          echo "Generating deployment blueprint..."
+          cat << EOF > /etc/guacamole/docker-compose.yml
+          version: '3.8'
+          services:
+            postgres:
+              image: postgres:15-alpine
+              container_name: guac-postgres
+              environment:
+                POSTGRES_DB: guacamole_db
+                POSTGRES_USER: guacadmin
+                POSTGRES_PASSWORD: GuacSecurePassword123!
+              volumes:
+                - /etc/guacamole/init:/docker-entrypoint-initdb.d
+              restart: always
+
+            guacd:
+              image: guacamole/guacd:latest
+              container_name: guac-guacd
+              restart: always
+
+            guacamole:
+              image: guacamole/guacamole:latest
+              container_name: guac-web
+              ports:
+                - "8080:8080"
+              environment:
+                GUACD_HOSTNAME: guacd
+                POSTGRES_HOSTNAME: postgres
+                POSTGRES_DATABASE: guacamole_db
+                POSTGRES_USER: guacadmin
+                POSTGRES_PASSWORD: GuacSecurePassword123!
+              restart: always
           EOF
-          
-          # Spin up the Guacamole Stack
-          docker network create guac-net
-          docker run -d --name guacd --network guac-net guacamole/guacd:latest
-          docker run -d --name guacamole --network guac-net \
-            -e GUACD_HOSTNAME=guacd \
-            -e GUACD_PORT=4822 \
-            -v /etc/guacamole:/etc/guacamole \
-            -p 8080:8080 \
-            guacamole/guacamole:latest
+
+          echo "Launching core services..."
+          cd /etc/guacamole
+          docker compose up -d
           '@
-          
-          # Clean up carriage returns for Linux compatibility and execute
-          $bashScript = $bashScript -replace "`r", ""
-          [System.IO.File]::WriteAllText("C:\setup_guac.sh", $bashScript)
+
+          $setupScript = $setupScript -replace "`r", ""
+          [System.IO.File]::WriteAllText("C:\setup_guac.sh", $setupScript)
           wsl -u root bash /mnt/c/setup_guac.sh
 
       - name: Deploy Cloudflare Tunnel & Keep Session Alive
         shell: powershell
         run: |
+          echo "Verifying local application endpoint health (Polling port 8080)..."
+          $LocalReady = $false
+          for ($i = 1; $i -le 45; $i++) {
+              try {
+                  $Response = Invoke-WebRequest -Uri "http://127.0.0.1:8080/guacamole/" -Method Head -TimeoutSec 2 -ErrorAction SilentlyContinue
+                  if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 302) {
+                      $LocalReady = $true
+                      break
+                  }
+              } catch {
+                  # Waiting for Java servlet compilation & startup sequence
+              }
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $LocalReady) {
+              Write-Error "Guacamole web dashboard failed to reply on port 8080. Diagnostic dumping:"
+              wsl docker ps -a
+              exit 1
+          }
+
           echo "Downloading Cloudflare Binary..."
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe"
           
-          echo "Initializing secure tunnel to Guacamole..."
-          # Merges stdout and stderr safely into tunnel.log
+          echo "Initializing secure tunnel..."
           Start-Process cmd -ArgumentList "/c .\cloudflared.exe tunnel --url http://localhost:8080 > tunnel.log 2>&1" -NoNewWindow
           
-          echo "Waiting for Cloudflare to generate tunnel URL (polling up to 45 seconds)..."
+          echo "Fetching assigned URL configuration..."
           $TunnelUrl = ""
-          
-          # Dynamic Polling Loop
-          for ($i = 1; $i -le 45; $i++) {
+          for ($j = 1; $j -le 30; $j++) {
               Start-Sleep -Seconds 1
               if (Test-Path "tunnel.log") {
                   $LogContent = Get-Content "tunnel.log" -Raw -ErrorAction SilentlyContinue
                   if ($LogContent) {
-                      # Native .NET Regex matching
                       $RegexMatch = [regex]::Match([string]$LogContent, "https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
                       if ($RegexMatch.Success) {
                           $TunnelUrl = $RegexMatch.Value
@@ -111,32 +139,36 @@ jobs:
           }
           
           if ([string]::IsNullOrEmpty($TunnelUrl)) {
-              Write-Error "Cloudflare failed to initialize a public assignment. Printing execution logs:"
-              Write-Host "----------------- DEBUG LOGS -----------------"
-              if (Test-Path "tunnel.log") {
-                  Get-Content "tunnel.log"
-              } else {
-                  Write-Host "No log file found."
-              }
-              Write-Host "----------------------------------------------"
+              Write-Error "Tunnel orchestration timed out. System diagnostics log:"
+              Get-Content "tunnel.log" -ErrorAction SilentlyContinue
               exit 1
           }
           
+          # Compute host gateway endpoint for network traversal inside Guacamole
+          $WindowsIP = wsl exec ip route | Select-String "default" | ForEach-Object { $_.Line.Split(' ')[2] }
+          
           Write-Host "========================================================"
-          Write-Host "APACHE GUACAMOLE WEB ADDRESS:"
-          Write-Host "Link: $TunnelUrl/guacamole/"
+          Write-Host "APACHE GUACAMOLE CONNECTIVITY PORTAL"
+          Write-Host "========================================================"
+          Write-Host "Access Link: $TunnelUrl/guacamole/"
           Write-Host ""
-          Write-Host "Guacamole Login: guacadmin"
-          Write-Host "Guacamole Password: guacadmin"
+          Write-Host "DEFAULT DASHBOARD LOGIN:"
+          Write-Host "Username: guacadmin"
+          Write-Host "Password: guacadmin"
+          Write-Host "========================================================"
+          Write-Host "MANUAL CONNECTION PARAMETERS (Add inside dashboard Settings):"
+          Write-Host "Protocol: rdp"
+          Write-Host "Hostname: $WindowsIP"
+          Write-Host "Port: 3389"
+          Write-Host "Username: runneradmin"
+          Write-Host "Password: GuacWinPass123!"
+          Write-Host "Ignore Server Certificate: Checked / True"
           Write-Host "========================================================"
           
-          Write-Host "System is active. Connection loop is monitoring live states."
-          Write-Host "To end this session, cancel the workflow run manually."
-          
-          # Standard maximum execution loop inside the SAME step to protect the tunnel process
+          # Maintain structural runtime context state
           for ($k = 1; $k -le 360; $k++) {
               Start-Sleep -Seconds 60
               if (($k % 10) -eq 0) {
-                  Write-Host "Session active check: $k minutes elapsed."
+                  Write-Host "Runtime heartbeat tracking check: $k minutes active."
               }
           }
