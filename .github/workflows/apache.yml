@@ -5,98 +5,127 @@ on:
 
 jobs:
   run-windows-guacamole:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
-      - name: Verify KVM Support
+      - name: Configure Native Windows RDP
+        shell: powershell
         run: |
-          echo "Checking for Hardware Virtualization Support..."
-          sudo apt-get update && sudo apt-get install -y qemu-kvm
-          ls -l /dev/kvm || echo "KVM not available, falling back to software emulation."
+          echo "Enabling Remote Desktop Services..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          echo "Setting up runneradmin authentication..."
+          $Password = ConvertTo-SecureString "GuacWinPass123!" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $Password
+          
+          echo "Ensuring user access rights..."
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
 
-      - name: Create Docker Network
-        run: docker network create vm-net
-
-      - name: Start Windows 10 Pro Container
+      - name: Initialize WSL2 and Ubuntu
+        shell: powershell
         run: |
-          docker run -d \
-            --name windows \
-            --network vm-net \
-            --device=/dev/kvm \
-            --cap-add NET_ADMIN \
-            -e VERSION="win10" \
-            -e RAM_SIZE="10G" \
-            -e CPU_CORES="4" \
-            dockurr/windows
+          echo "Installing Ubuntu subsystem..."
+          wsl --install -d Ubuntu --no-launch
+          Start-Sleep -Seconds 15
 
-      - name: Setup Apache Guacamole Stack
+      - name: Setup Apache Guacamole Stack inside WSL
+        shell: powershell
         run: |
-          echo "Creating Guacamole Configuration..."
-          mkdir -p config
-          cat << 'EOF' > config/user-mapping.xml
+          $bashScript = @'
+          # Update and install Docker prerequisites
+          apt-get update && apt-get install -y curl iptables
+          
+          # Force legacy iptables to ensure Docker works smoothly inside WSL2
+          update-alternatives --set iptables /usr/sbin/iptables-legacy || true
+          
+          # Install Docker CE
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          service docker start
+          
+          # Dynamically fetch the Windows Host Gateway IP from WSL
+          WINDOWS_HOST=$(ip route | grep default | awk '{print $3}')
+          echo "Windows Host Interface detected at: $WINDOWS_HOST"
+          
+          # Configure Guacamole User Mapping
+          mkdir -p /etc/guacamole
+          cat << EOF > /etc/guacamole/user-mapping.xml
           <user-mapping>
               <authorize username="guacadmin" password="guacadmin">
-                  <connection name="Windows 10 LTSC">
+                  <connection name="Windows Runner Native">
                       <protocol>rdp</protocol>
-                      <param name="hostname">windows</param>
+                      <param name="hostname">$WINDOWS_HOST</param>
                       <param name="port">3389</param>
                       <param name="security">any</param>
                       <param name="ignore-cert">true</param>
-                      <param name="username">docker</param>
-                      <param name="password"></param>
+                      <param name="username">runneradmin</param>
+                      <param name="password">GuacWinPass123!</param>
                   </connection>
               </authorize>
           </user-mapping>
           EOF
           
-          echo "Starting guacd (Guacamole Proxy)..."
-          docker run -d --name guacd --network vm-net guacamole/guacd
-          
-          echo "Starting Guacamole Web Client..."
-          # Mounting the config folder so Guacamole reads user-mapping.xml
-          docker run -d \
-            --name guacamole \
-            --network vm-net \
+          # Spin up the Guacamole Stack
+          docker network create guac-net
+          docker run -d --name guacd --network guac-net guacamole/guacd:latest
+          docker run -d --name guacamole --network guac-net \
             -e GUACD_HOSTNAME=guacd \
             -e GUACD_PORT=4822 \
-            -v ${{ github.workspace }}/config:/etc/guacamole \
+            -v /etc/guacamole:/etc/guacamole \
             -p 8080:8080 \
-            guacamole/guacamole
+            guacamole/guacamole:latest
+          '@
+          
+          # Clean up carriage returns for Linux compatibility and execute
+          $bashScript = $bashScript -replace "`r", ""
+          [System.IO.File]::WriteAllText("C:\setup_guac.sh", $bashScript)
+          wsl -u root bash /mnt/c/setup_guac.sh
 
-      - name: Setup Cloudflare Tunnel (HTTPS for Web Browser)
+      - name: Deploy Cloudflare Tunnel (trycloudflare)
+        shell: powershell
         run: |
-          echo "Downloading Cloudflare Tunnel..."
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
+          echo "Downloading Cloudflare Binary..."
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe"
           
-          echo "Starting HTTPS tunnel to Guacamole on port 8080..."
-          cloudflared tunnel --url http://localhost:8080 > tunnel.log 2>&1 &
+          echo "Initializing secure tunnel to Guacamole..."
+          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:8080" -RedirectStandardError "tunnel.log" -NoNewWindow
           
-          # Give the tunnel a moment to generate the URL
-          sleep 5
+          # Give Cloudflare a moment to register a public domain assignment
+          Start-Sleep -Seconds 12
           
-          echo "========================================================"
-          echo "🌐 APACHE GUACAMOLE WEB ADDRESS:"
-          TUNNEL_URL=$(cat tunnel.log | grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com')
+          # Extract the URL from the logging track
+          $TunnelUrl = ""
+          if (Test-Path "tunnel.log") {
+              $LogContent = Get-Content "tunnel.log"
+              if ($LogContent -match "https://[-a-zA-Z0-9]*\.trycloudflare\.com") {
+                  $TunnelUrl = $Matches[0]
+              }
+          }
           
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ ERROR: Cloudflare tunnel failed to start. Printing log:"
-            cat tunnel.log
-          else
-            echo "Link: $TUNNEL_URL/guacamole"
-            echo ""
-            echo "👤 Guacamole Login: guacadmin"
-            echo "🔑 Guacamole Password: guacadmin"
-            echo "========================================================"
-            echo "⚠️ NOTE ON TIMING:"
-            echo "Windows takes 15-20 minutes to install in the background."
-            echo "You can log into the Guacamole web UI immediately, but"
-            echo "clicking the VM connection will result in a 'Connection Error'"
-            echo "until Windows is fully booted and the RDP port is open."
-          fi
-          echo "========================================================"
+          if ([string]::IsNullOrEmpty($TunnelUrl)) {
+              Write-Error "Cloudflare failed to initialize public assignment. Log Context:"
+              Get-Content "tunnel.log"
+              exit 1
+          }
+          
+          Write-Host "========================================================"
+          Write-Host "🌐 APACHE GUACAMOLE WEB ADDRESS:"
+          Write-Host "Link: $TunnelUrl/guacamole/"
+          Write-Host ""
+          Write-Host "👤 Guacamole Login: guacadmin"
+          Write-Host "🔑 Guacamole Password: guacadmin"
+          Write-Host "========================================================"
 
-      - name: Monitor Installation and System Logs
+      - name: Keep Runner Session Alive
+        shell: powershell
         run: |
-          echo "Tailing Dockur logs to monitor Windows installation progress..."
-          echo "Keep this window open to keep the GitHub Actions runner alive."
-          docker logs -f windows
+          Write-Host "System is active. Connection loop is monitoring live states."
+          Write-Host "To end this session, cancel the workflow run manually."
+          
+          # Standard maximum execution loop (6 hours / 360 minutes max runner time limit)
+          for ($i = 1; $i -le 360; $i++) {
+              Start-Sleep -Seconds 60
+              if (($i % 10) -eq 0) {
+                  Write-Host "Session active check: $i minutes elapsed."
+              }
+          }
