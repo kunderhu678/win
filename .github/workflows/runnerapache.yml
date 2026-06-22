@@ -88,23 +88,37 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe"
           
           echo "Initializing secure tunnel to Guacamole..."
-          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:8080" -RedirectStandardError "tunnel.log" -NoNewWindow
+          # Merges stdout and stderr safely into tunnel.log using cmd native redirection
+          Start-Process cmd -ArgumentList "/c .\cloudflared.exe tunnel --url http://localhost:8080 > tunnel.log 2>&1" -NoNewWindow
           
-          # Give Cloudflare a moment to register a public domain assignment
-          Start-Sleep -Seconds 15
-          
-          # Extract the URL using -Raw to handle the log as a single string block
+          echo "Waiting for Cloudflare to generate tunnel URL (polling up to 45 seconds)..."
           $TunnelUrl = ""
-          if (Test-Path "tunnel.log") {
-              $LogContent = Get-Content "tunnel.log" -Raw
-              if ($LogContent -match "https://[-a-zA-Z0-9]*\.trycloudflare\.com") {
-                  $TunnelUrl = $Matches[0]
+          
+          # Dynamic Polling Loop
+          for ($i = 1; $i -le 45; $i++) {
+              Start-Sleep -Seconds 1
+              if (Test-Path "tunnel.log") {
+                  $LogContent = Get-Content "tunnel.log" -Raw -ErrorAction SilentlyContinue
+                  if ($LogContent) {
+                      # Native .NET Regex matching bypasses PowerShell array parsing limitations
+                      $RegexMatch = [regex]::Match([string]$LogContent, "https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
+                      if ($RegexMatch.Success) {
+                          $TunnelUrl = $RegexMatch.Value
+                          break
+                      }
+                  }
               }
           }
           
           if ([string]::IsNullOrEmpty($TunnelUrl)) {
-              Write-Error "Cloudflare failed to initialize public assignment. Log Context:"
-              Get-Content "tunnel.log"
+              Write-Error "Cloudflare failed to initialize a public assignment. Printing execution logs:"
+              Write-Host "----------------- DEBUG LOGS -----------------"
+              if (Test-Path "tunnel.log") {
+                  Get-Content "tunnel.log"
+              } else {
+                  Write-Host "No log file found."
+              }
+              Write-Host "----------------------------------------------"
               exit 1
           }
           
