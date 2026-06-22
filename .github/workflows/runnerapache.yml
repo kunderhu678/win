@@ -36,10 +36,7 @@ jobs:
           set -e
 
           echo "Installing Docker stack components..."
-          apt-get update && apt-get install -y curl iptables docker-compose-v2
-          
-          echo "Configuring legacy iptables for container routing..."
-          update-alternatives --set iptables /usr/sbin/iptables-legacy || true
+          apt-get update && apt-get install -y curl docker-compose-v2
           
           echo "Starting Docker Engine..."
           service docker start
@@ -47,7 +44,6 @@ jobs:
 
           echo "Preparing database migration files..."
           mkdir -p /etc/guacamole/init
-          # FIXED: Swapped out --postgres for the strictly required --postgresql argument
           docker run --rm guacamole/guacamole:latest /opt/guacamole/bin/initdb.sh --postgresql > /etc/guacamole/init/initdb.sql
 
           echo "Generating deployment blueprint..."
@@ -57,6 +53,7 @@ jobs:
             postgres:
               image: postgres:15-alpine
               container_name: guac-postgres
+              network_mode: host
               environment:
                 POSTGRES_DB: guacamole_db
                 POSTGRES_USER: guacadmin
@@ -68,16 +65,16 @@ jobs:
             guacd:
               image: guacamole/guacd:latest
               container_name: guac-guacd
+              network_mode: host
               restart: always
 
             guacamole:
               image: guacamole/guacamole:latest
               container_name: guac-web
-              ports:
-                - "8080:8080"
+              network_mode: host
               environment:
-                GUACD_HOSTNAME: guacd
-                POSTGRES_HOSTNAME: postgres
+                GUACD_HOSTNAME: 127.0.0.1
+                POSTGRES_HOSTNAME: 127.0.0.1
                 POSTGRES_DATABASE: guacamole_db
                 POSTGRES_USER: guacadmin
                 POSTGRES_PASSWORD: GuacSecurePassword123!
