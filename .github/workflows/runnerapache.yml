@@ -16,259 +16,149 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           
-          # Set RDP security layer to allow connections
+          # Set RDP security layer
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
           
-          # Use existing runneradmin user or create new RDP user
+          # Set password for existing runneradmin user
           $rdpPassword = "RunnerPass123!"
+          $password = ConvertTo-SecureString $rdpPassword -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $password -ErrorAction SilentlyContinue
           
-          # Check if runneradmin exists
-          $existingUser = Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
-          
-          if ($existingUser) {
-            Write-Host "Using existing runneradmin user"
-            # Set password for existing user
-            $password = ConvertTo-SecureString $rdpPassword -AsPlainText -Force
-            Set-LocalUser -Name "runneradmin" -Password $password
-          } else {
-            # Create new RDP user
-            Write-Host "Creating new RDP user"
-            $password = ConvertTo-SecureString $rdpPassword -AsPlainText -Force
-            New-LocalUser -Name "rdpuser" -Password $password -FullName "RDP User" -Description "RDP Access User"
-          }
-          
-          # Add users to Remote Desktop Users group
+          # Add to Remote Desktop Users
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
           
-          if (Get-LocalUser -Name "rdpuser" -ErrorAction SilentlyContinue) {
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser"
-            Add-LocalGroupMember -Group "Administrators" -Member "rdpuser"
-          }
-          
-          # Ensure runneradmin is in Administrators group
-          Add-LocalGroupMember -Group "Administrators" -Member "runneradmin" -ErrorAction SilentlyContinue
-          
-          # Restart RDP service to apply changes
+          # Restart RDP service
           Restart-Service TermService -Force
           
-          # Display connection info
-          Write-Host "========================================================"
-          Write-Host "RDP Configuration Complete!"
-          Write-Host "Username: runneradmin"
-          Write-Host "Password: $rdpPassword"
-          Write-Host "========================================================"
-
-      - name: Get Windows IP Address
-        shell: pwsh
-        run: |
-          # Get the primary IP address
-          $ipAddress = (Get-NetIPAddress -AddressFamily IPv4 | 
-            Where-Object {$_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -ne "127.0.0.1"} | 
-            Select-Object -First 1).IPAddress
-          
-          Write-Host "Windows IP Address: $ipAddress"
-          echo "WINDOWS_IP=$ipAddress" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "RDP configured. Username: runneradmin, Password: $rdpPassword"
 
       - name: Install WSL
         shell: pwsh
         run: |
           Write-Host "Installing WSL..."
-          wsl --install -d Ubuntu-22.04 --no-launch
-          
-          # Wait for installation
+          wsl --install -d Ubuntu-22.04 --no-launch 2>$null
           Start-Sleep -Seconds 30
-          
-          # Set WSL version
           wsl --set-default-version 2
-          
-          Write-Host "WSL installed successfully"
+          Write-Host "WSL installed"
 
       - name: Setup Docker and Guacamole in WSL
         shell: pwsh
         run: |
-          # Create setup script for WSL
-          $setupScript = @'
-          #!/bin/bash
-          set -e
+          # Create setup commands
+          $commands = @(
+            "sudo apt-get update -qq",
+            "curl -fsSL https://get.docker.com | sudo sh",
+            "sudo service docker start",
+            "sudo usermod -aG docker root",
+            "mkdir -p /root/guacamole/config",
+            "cat > /root/guacamole/config/user-mapping.xml << 'EOF'",
+            "<user-mapping>",
+            "    <authorize username=\"guacadmin\" password=\"guacadmin\">",
+            "        <connection name=\"Windows Runner RDP\">",
+            "            <protocol>rdp</protocol>",
+            "            <param name=\"hostname\">host.docker.internal</param>",
+            "            <param name=\"port\">3389</param>",
+            "            <param name=\"security\">any</param>",
+            "            <param name=\"ignore-cert\">true</param>",
+            "            <param name=\"username\">runneradmin</param>",
+            "            <param name=\"password\">RunnerPass123!</param>",
+            "        </connection>",
+            "    </authorize>",
+            "</user-mapping>",
+            "EOF",
+            "docker run -d --name guacd --restart unless-stopped guacamole/guacd",
+            "docker run -d --name guacamole --restart unless-stopped -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -v /root/guacamole/config:/etc/guacamole --link guacd:guacd -p 8080:8080 guacamole/guacamole",
+            "echo 'Guacamole setup complete'",
+            "sleep 10",
+            "curl -s http://localhost:8080/guacamole/ | head -n 5"
+          )
           
-          echo "Installing Docker..."
-          curl -fsSL https://get.docker.com -o get-docker.sh
-          sudo sh get-docker.sh
-          sudo service docker start
-          sudo usermod -aG docker $USER
-          
-          echo "Creating Guacamole configuration..."
-          mkdir -p ~/guacamole/config
-          
-          # Create user-mapping.xml
-          cat > ~/guacamole/config/user-mapping.xml << 'XMLEOF'
-          <user-mapping>
-              <authorize username="guacadmin" password="guacadmin">
-                  <connection name="Windows Runner RDP">
-                      <protocol>rdp</protocol>
-                      <param name="hostname">host.docker.internal</param>
-                      <param name="port">3389</param>
-                      <param name="security">any</param>
-                      <param name="ignore-cert">true</param>
-                      <param name="username">runneradmin</param>
-                      <param name="password">RunnerPass123!</param>
-                      <param name="resize-method">display-update</param>
-                      <param name="enable-wallpaper">false</param>
-                      <param name="enable-theming">false</param>
-                      <param name="enable-font-smoothing">true</param>
-                      <param name="enable-full-window-drag">false</param>
-                      <param name="enable-desktop-composition">false</param>
-                      <param name="enable-menu-animations">false</param>
-                  </connection>
-              </authorize>
-          </user-mapping>
-          XMLEOF
-          
-          echo "Starting Guacamole daemon..."
-          docker run -d \
-            --name guacd \
-            --restart unless-stopped \
-            guacamole/guacd
-          
-          echo "Starting Guacamole web client..."
-          docker run -d \
-            --name guacamole \
-            --restart unless-stopped \
-            -e GUACD_HOSTNAME=guacd \
-            -e GUACD_PORT=4822 \
-            -v ~/guacamole/config:/etc/guacamole \
-            --link guacd:guacd \
-            -p 8080:8080 \
-            guacamole/guacamole
-          
-          echo "Guacamole setup complete!"
-          echo "Testing Guacamole connectivity..."
-          sleep 5
-          curl -s http://localhost:8080/guacamole/ | head -n 5
-          '@
-          
-          # Save and execute the script in WSL
-          $setupScript | Out-File -FilePath $env:TEMP\wsl-setup.sh -Encoding ASCII
-          wsl bash /mnt/c/Users/runneradmin/AppData/Local/Temp/wsl-setup.sh
+          # Execute each command in WSL
+          foreach ($cmd in $commands) {
+            Write-Host "Executing: $cmd"
+            wsl bash -c $cmd
+            Start-Sleep -Seconds 1
+          }
           
           Write-Host "Docker and Guacamole setup complete!"
 
       - name: Setup Cloudflare Tunnel
         shell: pwsh
         run: |
-          # Install and start Cloudflare tunnel in WSL
-          $tunnelScript = @'
-          #!/bin/bash
-          set -e
+          # Install cloudflared
+          wsl bash -c "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+          wsl bash -c "sudo dpkg -i cloudflared-linux-amd64.deb"
           
-          echo "Installing Cloudflare tunnel..."
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
+          # Start tunnel in background
+          wsl bash -c "nohup cloudflared tunnel --url http://localhost:8080 > /root/tunnel.log 2>&1 &"
           
-          echo "Starting Cloudflare tunnel..."
-          nohup cloudflared tunnel --url http://localhost:8080 > ~/tunnel.log 2>&1 &
+          Write-Host "Waiting for tunnel to establish..."
+          Start-Sleep -Seconds 15
           
-          # Wait for tunnel to establish
-          sleep 15
+          # Extract tunnel URL
+          $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /root/tunnel.log | head -n 1"
           
-          echo "Tunnel started. Extracting URL..."
-          TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' ~/tunnel.log | head -n 1)
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "Waiting for tunnel URL..."
-            sleep 10
-            TUNNEL_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' ~/tunnel.log | head -n 1)
-          fi
-          
-          echo "TUNNEL_URL=$TUNNEL_URL" > /tmp/tunnel_info.txt
-          cat /tmp/tunnel_info.txt
-          '@
-          
-          # Save and execute
-          $tunnelScript | Out-File -FilePath $env:TEMP\tunnel-setup.sh -Encoding ASCII
-          wsl bash /mnt/c/Users/runneradmin/AppData/Local/Temp/tunnel-setup.sh
-          
-          # Read tunnel URL from WSL
-          $tunnelInfo = wsl bash -c "cat /tmp/tunnel_info.txt 2>/dev/null || echo 'TUNNEL_URL='"
-          Write-Host "Tunnel Info: $tunnelInfo"
-          
-          # Extract URL and save to environment
-          if ($tunnelInfo -match 'TUNNEL_URL=(https://[^\s]+)') {
-            $tunnelUrl = $matches[1]
-            echo "TUNNEL_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "Tunnel URL extracted: $tunnelUrl"
+          if (-not $tunnelUrl) {
+            Write-Host "Waiting additional time for tunnel..."
+            Start-Sleep -Seconds 10
+            $tunnelUrl = wsl bash -c "grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /root/tunnel.log | head -n 1"
           }
+          
+          Write-Host "Tunnel URL: $tunnelUrl"
+          echo "TUNNEL_URL=$tunnelUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Display Connection Information
         shell: pwsh
         run: |
           Write-Host "========================================================" -ForegroundColor Green
-          Write-Host "🌐 APACHE GUACAMOLE WEB INTERFACE" -ForegroundColor Green
+          Write-Host "APACHE GUACAMOLE WEB INTERFACE" -ForegroundColor Green
           Write-Host "========================================================" -ForegroundColor Green
           
           if ($env:TUNNEL_URL) {
             Write-Host "URL: $env:TUNNEL_URL/guacamole" -ForegroundColor Cyan
           } else {
-            Write-Host "Checking tunnel logs..." -ForegroundColor Yellow
-            wsl bash -c 'cat ~/tunnel.log 2>/dev/null | grep -o "https://[-a-zA-Z0-9]*\.trycloudflare\.com" | head -n 1'
+            Write-Host "Tunnel URL not found. Checking logs..." -ForegroundColor Yellow
+            wsl bash -c "cat /root/tunnel.log"
           }
           
           Write-Host ""
-          Write-Host "🔑 GUACAMOLE LOGIN:" -ForegroundColor Yellow
+          Write-Host "GUACAMOLE LOGIN:" -ForegroundColor Yellow
           Write-Host "Username: guacadmin" -ForegroundColor White
           Write-Host "Password: guacadmin" -ForegroundColor White
           Write-Host ""
-          Write-Host "💻 WINDOWS RDP CREDENTIALS:" -ForegroundColor Yellow
+          Write-Host "WINDOWS RDP CREDENTIALS:" -ForegroundColor Yellow
           Write-Host "Username: runneradmin" -ForegroundColor White
           Write-Host "Password: RunnerPass123!" -ForegroundColor White
           Write-Host ""
-          Write-Host "📝 INSTRUCTIONS:" -ForegroundColor Yellow
+          Write-Host "INSTRUCTIONS:" -ForegroundColor Yellow
           Write-Host "1. Open the Guacamole URL in your browser" -ForegroundColor White
-          Write-Host "2. Log in with the Guacamole credentials above" -ForegroundColor White
-          Write-Host "3. Click on 'Windows Runner RDP' connection" -ForegroundColor White
-          Write-Host "4. You will be connected to the Windows runner desktop" -ForegroundColor White
+          Write-Host "2. Log in with the credentials above" -ForegroundColor White
+          Write-Host "3. Click on 'Windows Runner RDP' to connect" -ForegroundColor White
           Write-Host "========================================================" -ForegroundColor Green
-          
-          # Display tunnel logs for debugging
-          Write-Host "`nTunnel logs (last 10 lines):" -ForegroundColor Gray
-          wsl bash -c 'tail -n 10 ~/tunnel.log 2>/dev/null || echo "No tunnel log found"'
 
       - name: Keep Session Alive
         shell: pwsh
         run: |
-          Write-Host "========================================================" -ForegroundColor Green
-          Write-Host "✅ WINDOWS RDP SESSION IS ACTIVE" -ForegroundColor Green
-          Write-Host "========================================================" -ForegroundColor Green
-          Write-Host "Session will remain active for up to 6 hours."
-          Write-Host "Press Ctrl+C in the GitHub Actions log to end the session."
-          Write-Host "========================================================" -ForegroundColor Green
+          Write-Host "Session will remain active for up to 6 hours" -ForegroundColor Green
           
-          $jobTimeout = 350 * 60  # 350 minutes
+          $jobTimeout = 350 * 60
           $startTime = Get-Date
-          $statusInterval = 60  # Show status every 60 seconds
           $lastStatus = 0
           
           while ($true) {
             $elapsed = ((Get-Date) - $startTime).TotalSeconds
             
             if ($elapsed -gt $jobTimeout) {
-              Write-Host "Job timeout reached. Shutting down..."
+              Write-Host "Timeout reached. Shutting down..."
               break
             }
             
-            # Display status periodically
-            if ($elapsed - $lastStatus -ge $statusInterval) {
+            if ($elapsed - $lastStatus -ge 120) {
               $remaining = [math]::Round(($jobTimeout - $elapsed) / 60)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $remaining minutes remaining" -ForegroundColor Cyan
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $remaining minutes remaining" -ForegroundColor Cyan
               $lastStatus = $elapsed
-              
-              # Check if tunnel is still running
-              $tunnelCheck = wsl bash -c 'pgrep cloudflared > /dev/null && echo "running" || echo "stopped"' 2>$null
-              if ($tunnelCheck -eq "stopped") {
-                Write-Host "⚠️ WARNING: Cloudflare tunnel appears to be down!" -ForegroundColor Red
-              }
             }
             
-            Start-Sleep -Seconds 10
+            Start-Sleep -Seconds 15
           }
