@@ -26,7 +26,7 @@ jobs:
           $hostname = "$user-$date"
           
           # HARDCODED KEY APPLIED BELOW
-          $authKey = "tskey-auth-kdwEDGrwkU11CNTRL-ioC5AV4bU5a5gqDLi5nD6a2EHaKvsjs1"
+          $authKey = "tskey-auth-kXAB7rZSdS11CNTRL-1yLGrjhsMaTHQo2vLkRVaTY5VwgApVRC"
 
           & "C:\Program Files\Tailscale\tailscale.exe" up `
             --authkey=$authKey `
